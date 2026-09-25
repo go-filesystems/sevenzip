@@ -9,6 +9,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"unicode/utf16"
 )
 
@@ -81,6 +82,62 @@ type fileRecord struct {
 	unpackSize int64
 	packSize   int64
 	crc        uint32
+	perm       fs.FileMode
+	// dir and empty say which of the three kinds of entry this is. 7z stores no
+	// stream for either, and tells them apart with two bit vectors: kEmptyStream
+	// over every entry, then kEmptyFile over only the ones it marked. So a
+	// directory is "no stream, and not an empty file" -- an absence described
+	// twice, and a reader that sees only the first vector calls it an empty file.
+	dir   bool
+	empty bool
+}
+
+// hasStream is true for the entries a pack stream was written for.
+func (f fileRecord) hasStream() bool { return !f.dir && !f.empty }
+
+// POSIX file types, because the attribute word carries a POSIX mode and not an
+// os.FileMode: os.ModeDir is 1<<31, so narrowing an os.FileMode to the sixteen
+// bits this field has room for drops every type bit and leaves a directory
+// indistinguishable from a file with the same permissions.
+const (
+	sIFDIR = 0o040000
+	sIFREG = 0o100000
+)
+
+// Windows attribute bits, which is what the field is named after and holds
+// first. 0x8000 says the high sixteen bits carry a POSIX mode -- an extension,
+// and the one the reference implementation writes on Unix.
+const (
+	attrDirectory = 0x10
+	attrArchive   = 0x20
+	attrUnixMode  = 0x8000
+)
+
+// attributes is the word kWinAttributes carries for this entry.
+func (f fileRecord) attributes() uint32 {
+	mode := uint32(f.perm.Perm())
+	win := uint32(attrArchive)
+	if f.dir {
+		win, mode = attrDirectory, mode|sIFDIR
+	} else {
+		mode |= sIFREG
+	}
+	return win | attrUnixMode | mode<<16
+}
+
+// withStreams are the entries that have one.
+//
+// PackInfo, UnpackInfo and SubStreamsInfo must count only these, while FilesInfo
+// names them all. Counting every entry everywhere describes streams that were
+// never written, and a reader then goes looking for them.
+func (z *Writer) withStreams() []fileRecord {
+	out := make([]fileRecord, 0, len(z.files))
+	for _, f := range z.files {
+		if f.hasStream() {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // NewWriter reserves the signature header and returns a Writer ready for its
@@ -106,6 +163,40 @@ func NewWriter(w io.WriteSeeker, opts ...Option) (*Writer, error) {
 // returned writer is what puts bytes in the archive; the entry ends when the
 // next Create or Close is called.
 func (z *Writer) Create(name string) (io.Writer, error) {
+	return z.create(name, 0o644)
+}
+
+// AddDir records a directory. No stream is written for it, and its mode is kept
+// in the attribute word.
+func (z *Writer) AddDir(name string, perm fs.FileMode) error {
+	if z.closed {
+		return ErrClosed
+	}
+	if err := z.finishEntry(); err != nil {
+		return err
+	}
+	if name == "" {
+		return errors.New("sevenzip: a directory with no name")
+	}
+	z.files = append(z.files, fileRecord{name: name, perm: perm, dir: true})
+	return nil
+}
+
+// AddFile records a file and copies its contents in.
+//
+// AddDir and AddFile together are the shape a deferred write layer seals
+// through, so that the thing rewriting an archive at the end does not have to
+// know which format it is rewriting.
+func (z *Writer) AddFile(name string, perm fs.FileMode, src io.Reader) error {
+	w, err := z.create(name, perm)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, src)
+	return err
+}
+
+func (z *Writer) create(name string, perm fs.FileMode) (io.Writer, error) {
 	if z.closed {
 		return nil, ErrClosed
 	}
@@ -122,7 +213,7 @@ func (z *Writer) Create(name string) (io.Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	z.cur = &entryWriter{z: z, name: name, crc: crc32.NewIEEE(),
+	z.cur = &entryWriter{z: z, name: name, perm: perm, crc: crc32.NewIEEE(),
 		sink: sink, counted: counted, finish: finish}
 	return z.cur, nil
 }
@@ -143,6 +234,8 @@ func (z *Writer) finishEntry() error {
 	z.pos += e.counted.n
 	z.files = append(z.files, fileRecord{
 		name:       e.name,
+		perm:       e.perm,
+		empty:      e.n == 0,
 		unpackSize: e.n,
 		packSize:   e.counted.n,
 		crc:        e.crc.Sum32(),
@@ -214,6 +307,7 @@ func writeSignature(w io.Writer, headerOffset, headerSize int64, headerCRC uint3
 type entryWriter struct {
 	z       *Writer
 	name    string
+	perm    fs.FileMode
 	n       int64 // bytes handed IN, which is the unpacked size
 	sink    io.Writer
 	counted *countingWriter
@@ -247,7 +341,7 @@ func (z *Writer) header() []byte {
 	var b bytes.Buffer
 	b.WriteByte(idHeader)
 
-	if len(z.files) > 0 {
+	if len(z.withStreams()) > 0 {
 		b.WriteByte(idMainStreamsInfo)
 		z.writePackInfo(&b)
 		z.writeUnpackInfo(&b)
@@ -263,11 +357,12 @@ func (z *Writer) header() []byte {
 // writePackInfo says where the packed streams are and how big each one is. For
 // stored entries the packed size IS the size.
 func (z *Writer) writePackInfo(b *bytes.Buffer) {
+	streams := z.withStreams()
 	b.WriteByte(idPackInfo)
 	_ = writeNumber(b, 0) // packPos: the first stream begins right after the signature
-	_ = writeNumber(b, uint64(len(z.files)))
+	_ = writeNumber(b, uint64(len(streams)))
 	b.WriteByte(idSize)
-	for _, f := range z.files {
+	for _, f := range streams {
 		_ = writeNumber(b, uint64(f.packSize))
 	}
 	b.WriteByte(idEnd)
@@ -276,12 +371,13 @@ func (z *Writer) writePackInfo(b *bytes.Buffer) {
 // writeUnpackInfo describes one folder per entry, each holding a single Copy
 // coder, and what each folder checks out at.
 func (z *Writer) writeUnpackInfo(b *bytes.Buffer) {
+	streams := z.withStreams()
 	b.WriteByte(idUnpackInfo)
 
 	b.WriteByte(idFolder)
-	_ = writeNumber(b, uint64(len(z.files)))
+	_ = writeNumber(b, uint64(len(streams)))
 	b.WriteByte(0) // external: the folder definitions are right here
-	for range z.files {
+	for range streams {
 		_ = writeNumber(b, 1) // one coder
 		b.WriteByte(z.coder.flags())
 		b.Write(z.coder.id)
@@ -292,7 +388,7 @@ func (z *Writer) writeUnpackInfo(b *bytes.Buffer) {
 	}
 
 	b.WriteByte(idCodersUnpackSize)
-	for _, f := range z.files {
+	for _, f := range streams {
 		_ = writeNumber(b, uint64(f.unpackSize))
 	}
 
@@ -315,7 +411,7 @@ func (z *Writer) writeSubStreamsInfo(b *bytes.Buffer) {
 	b.WriteByte(idSubStreamsInfo)
 	b.WriteByte(idCRC)
 	b.WriteByte(1) // every digest is defined
-	for _, f := range z.files {
+	for _, f := range z.withStreams() {
 		var crc [4]byte
 		binary.LittleEndian.PutUint32(crc[:], f.crc)
 		b.Write(crc[:])
@@ -343,9 +439,86 @@ func (z *Writer) writeFilesInfo(b *bytes.Buffer) {
 		}
 		names.Write([]byte{0, 0}) // the terminator is two bytes, like the units
 	}
+	z.writeEmptyVectors(b)
+
 	b.WriteByte(idName)
 	_ = writeNumber(b, uint64(names.Len()))
 	b.Write(names.Bytes())
 
+	var attrs bytes.Buffer
+	attrs.WriteByte(1) // every attribute is defined
+	attrs.WriteByte(0) // external: they are right here
+	for _, f := range z.files {
+		var a [4]byte
+		binary.LittleEndian.PutUint32(a[:], f.attributes())
+		attrs.Write(a[:])
+	}
+	b.WriteByte(idWinAttributes)
+	_ = writeNumber(b, uint64(attrs.Len()))
+	b.Write(attrs.Bytes())
+
 	b.WriteByte(idEnd)
+}
+
+// writeEmptyVectors marks the entries that carry no stream, and then which of
+// those are files rather than directories.
+//
+// The second vector is over the MARKED entries only, not over every entry. Its
+// length therefore depends on the first vector's contents, which is why the two
+// are written together here rather than wherever each tag belongs.
+//
+// Both are omitted when nothing is marked: kEmptyFile absent means every
+// stream-less entry is a directory, so an archive of ordinary files writes
+// neither and reads back exactly as it did before this existed.
+func (z *Writer) writeEmptyVectors(b *bytes.Buffer) {
+	var noStream, isFile []bool
+	for _, f := range z.files {
+		noStream = append(noStream, !f.hasStream())
+		if !f.hasStream() {
+			isFile = append(isFile, !f.dir)
+		}
+	}
+	if !anySet(noStream) {
+		return
+	}
+	writeTaggedVector(b, idEmptyStream, noStream)
+	if anySet(isFile) {
+		writeTaggedVector(b, idEmptyFile, isFile)
+	}
+}
+
+func anySet(bits []bool) bool {
+	for _, v := range bits {
+		if v {
+			return true
+		}
+	}
+	return false
+}
+
+// writeTaggedVector writes a property whose payload is one bit per value.
+//
+// The bits go MOST significant first within each byte, and the last byte is
+// padded with zeros. Filling from the low bit instead produces a vector of the
+// right LENGTH holding the wrong entries, which a reader accepts and then
+// reports a directory where a file was.
+func writeTaggedVector(b *bytes.Buffer, id byte, bits []bool) {
+	var v bytes.Buffer
+	var cur byte
+	var n int
+	for _, set := range bits {
+		if set {
+			cur |= 0x80 >> n
+		}
+		if n++; n == 8 {
+			v.WriteByte(cur)
+			cur, n = 0, 0
+		}
+	}
+	if n > 0 {
+		v.WriteByte(cur)
+	}
+	b.WriteByte(id)
+	_ = writeNumber(b, uint64(v.Len()))
+	b.Write(v.Bytes())
 }

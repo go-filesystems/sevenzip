@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/bodgit/sevenzip"
@@ -212,4 +213,282 @@ func indexOf(h, n string) int {
 		}
 	}
 	return -1
+}
+
+// entry is one thing to put in an archive, with the kinds kept apart because
+// telling them apart is what these tests are about.
+type entry struct {
+	name string
+	perm os.FileMode
+	dir  bool
+	body string
+}
+
+// writeTree builds an archive through AddDir and AddFile, in the order given.
+func writeTree(t *testing.T, entries []entry) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "tree.7z")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, err := NewWriter(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.dir {
+			if err := z.AddDir(e.name, e.perm); err != nil {
+				t.Fatalf("AddDir(%q): %v", e.name, err)
+			}
+			continue
+		}
+		if err := z.AddFile(e.name, e.perm, strings.NewReader(e.body)); err != nil {
+			t.Fatalf("AddFile(%q): %v", e.name, err)
+		}
+	}
+	if err := z.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// tree is the fixture, and its shape is the point.
+//
+// It holds all three kinds at once -- a directory, an empty FILE, and files with
+// bytes -- because the second bit vector is over the stream-less entries only.
+// With one such entry the vector is a single bit and its position cannot be
+// wrong; with two of DIFFERENT kinds, a vector filled from the wrong end, or
+// omitted, names the wrong one.
+//
+// The directory comes first and the empty file second so that the bits differ:
+// were they the other way round the byte would be symmetric under the mistake.
+func tree() []entry {
+	return []entry{
+		{name: "sub", perm: 0o755, dir: true},
+		{name: "empty.txt", perm: 0o644},
+		{name: "a.txt", perm: 0o644, body: "hello"},
+		{name: "sub/b.txt", perm: 0o600, body: "x"},
+	}
+}
+
+// TestTheReferenceExtractsADirectoryAsADirectory is the judge that cannot agree
+// with us by accident.
+//
+// It does not ask 7-Zip to parse the header; it asks it to EXTRACT, and then
+// looks at what appeared on the filesystem. A directory that arrives as an empty
+// file, or an empty file that arrives as a directory, is then a stat away --
+// which is the actual consequence of getting these two vectors wrong, and the
+// one a "t" verdict cannot show, since both are valid archives.
+func TestTheReferenceExtractsADirectoryAsADirectory(t *testing.T) {
+	bin := ""
+	for _, name := range []string{"7zz", "7z", "7za"} {
+		if p, err := exec.LookPath(name); err == nil {
+			bin = p
+			break
+		}
+	}
+	if bin == "" {
+		t.Skip("no 7-Zip binary here to judge the archive with")
+	}
+
+	archive := writeTree(t, tree())
+	into := filepath.Join(t.TempDir(), "out")
+
+	out, err := exec.Command(bin, "x", "-bso0", "-bsp0", "-o"+into, archive).CombinedOutput()
+	if err != nil {
+		t.Fatalf("7-Zip could not extract it: %v\n%s", err, out)
+	}
+
+	for _, e := range tree() {
+		fi, err := os.Lstat(filepath.Join(into, e.name))
+		if err != nil {
+			t.Errorf("%s did not arrive: %v", e.name, err)
+			continue
+		}
+		if fi.IsDir() != e.dir {
+			t.Errorf("%s: IsDir() = %v, want %v", e.name, fi.IsDir(), e.dir)
+			continue
+		}
+		if e.dir {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(into, e.name))
+		if err != nil {
+			t.Errorf("%s: %v", e.name, err)
+			continue
+		}
+		if string(b) != e.body {
+			t.Errorf("%s = %q, want %q", e.name, b, e.body)
+		}
+		if got := fi.Mode().Perm(); got != e.perm {
+			t.Errorf("%s: mode %v, want %v", e.name, got, e.perm)
+		}
+	}
+}
+
+// TestTheGoReaderTellsTheThreeKindsApart is the second judge, and it is the one
+// that runs where no binary does.
+func TestTheGoReaderTellsTheThreeKindsApart(t *testing.T) {
+	archive := writeTree(t, tree())
+
+	r, err := sevenzip.OpenReader(archive)
+	if err != nil {
+		t.Fatalf("the Go reader refused it: %v", err)
+	}
+	defer r.Close()
+
+	// The reader appends a slash to a directory's name -- its own convention, so
+	// that the entries satisfy io/fs, and not something the archive carries. The
+	// name is normalised here rather than expected, because asserting the slash
+	// would pin that reader's convention as though it were the format's.
+	seen := map[string]*sevenzip.File{}
+	for _, f := range r.File {
+		seen[strings.TrimSuffix(f.Name, "/")] = f
+	}
+	if len(seen) != len(tree()) {
+		t.Fatalf("read back %d entries, want %d: %v", len(seen), len(tree()), keysOf(seen))
+	}
+	for _, e := range tree() {
+		f, ok := seen[e.name]
+		if !ok {
+			t.Errorf("%s is missing from the archive", e.name)
+			continue
+		}
+		fi := f.FileInfo()
+		if fi.IsDir() != e.dir {
+			t.Errorf("%s: IsDir() = %v, want %v", e.name, fi.IsDir(), e.dir)
+			continue
+		}
+		if got := fi.Mode().Perm(); got != e.perm {
+			t.Errorf("%s: mode %v, want %v", e.name, got, e.perm)
+		}
+		if e.dir {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Errorf("%s: %v", e.name, err)
+			continue
+		}
+		b, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Errorf("%s: %v", e.name, err)
+			continue
+		}
+		if string(b) != e.body {
+			t.Errorf("%s = %q, want %q", e.name, b, e.body)
+		}
+	}
+}
+
+func keysOf(m map[string]*sevenzip.File) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestWriteTaggedVectorFillsFromTheHighBit pins the bit order on its own,
+// without a reader in the way.
+//
+// Both readers have another channel for the same fact -- the attribute word also
+// says directory or file -- so a vector filled from the wrong end can be hidden
+// by attributes that happen to be right. This asserts the bytes.
+func TestWriteTaggedVectorFillsFromTheHighBit(t *testing.T) {
+	for _, c := range []struct {
+		bits []bool
+		want []byte
+	}{
+		{[]bool{true}, []byte{0x80}},
+		{[]bool{false, true}, []byte{0x40}},
+		{[]bool{true, true, false, false}, []byte{0xC0}},
+		{[]bool{false, false, false, false, false, false, false, true}, []byte{0x01}},
+		// Nine bits, so the second byte is padded: the ninth is the high bit of
+		// it and not the low bit of the first.
+		{[]bool{false, false, false, false, false, false, false, false, true}, []byte{0x00, 0x80}},
+	} {
+		var b bytes.Buffer
+		writeTaggedVector(&b, idEmptyStream, c.bits)
+		got := b.Bytes()
+		if len(got) < 2 || got[0] != idEmptyStream {
+			t.Fatalf("%v: no tag in %x", c.bits, got)
+		}
+		if int(got[1]) != len(c.want) {
+			t.Errorf("%v: size %d, want %d", c.bits, got[1], len(c.want))
+			continue
+		}
+		if !bytes.Equal(got[2:], c.want) {
+			t.Errorf("%v: payload %x, want %x", c.bits, got[2:], c.want)
+		}
+	}
+}
+
+// TestAnArchiveOfOrdinaryFilesWritesNeitherVector.
+//
+// Both vectors describe an absence, and an archive with nothing absent must not
+// carry them: the reference omits them, and emitting a vector of all-zero bits
+// would be a second way to say the same thing that readers have to agree about.
+func TestAnArchiveOfOrdinaryFilesWritesNeitherVector(t *testing.T) {
+	var b bytes.Buffer
+	z := &Writer{files: []fileRecord{{name: "a", unpackSize: 1}}}
+	z.writeEmptyVectors(&b)
+	if b.Len() != 0 {
+		t.Errorf("wrote %x, want nothing", b.Bytes())
+	}
+}
+
+// TestEveryStreamlessEntryBeingADirectoryOmitsTheSecondVector.
+//
+// kEmptyFile absent means "all of them are directories", so an archive of
+// nothing but directories writes only the first vector. Writing a second one
+// full of zeros would say the same thing the long way.
+func TestEveryStreamlessEntryBeingADirectoryOmitsTheSecondVector(t *testing.T) {
+	var b bytes.Buffer
+	z := &Writer{files: []fileRecord{{name: "a", dir: true}, {name: "b", dir: true}}}
+	z.writeEmptyVectors(&b)
+	want := []byte{idEmptyStream, 1, 0xC0}
+	if !bytes.Equal(b.Bytes(), want) {
+		t.Errorf("wrote %x, want %x", b.Bytes(), want)
+	}
+}
+
+// TestBothVectorsReachTheHeader, and it runs where no 7-Zip binary does.
+//
+// The ablation that removes kEmptyFile altogether is caught by the reference's
+// extraction and by NOTHING else: the pure-Go reader still reports the right
+// kinds, because it falls back on the attribute word, which this writer also
+// fills in correctly. Two channels carry the same fact, so a reader-level test
+// cannot tell which one it read.
+//
+// This asserts the bytes instead. 0xC0 marks the first two of four entries as
+// stream-less, and 0x40 says the second of THOSE two is a file -- so the
+// directory is the first, by the absence of a bit.
+func TestBothVectorsReachTheHeader(t *testing.T) {
+	z := &Writer{coder: mustCoder(t), files: []fileRecord{
+		{name: "sub", perm: 0o755, dir: true},
+		{name: "empty.txt", perm: 0o644, empty: true},
+		{name: "a.txt", perm: 0o644, unpackSize: 5, packSize: 5},
+		{name: "sub/b.txt", perm: 0o600, unpackSize: 1, packSize: 1},
+	}}
+	h := z.header()
+	want := []byte{idEmptyStream, 1, 0xC0, idEmptyFile, 1, 0x40}
+	if !bytes.Contains(h, want) {
+		t.Errorf("the header does not carry %x:\n%x", want, h)
+	}
+}
+
+func mustCoder(t *testing.T) *coder {
+	t.Helper()
+	c, err := newCoder(Store, 1<<22)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
