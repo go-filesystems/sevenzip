@@ -52,9 +52,9 @@ func TestNumberWidthsAreWhatTheFormatSays(t *testing.T) {
 		want int
 	}{
 		{0, 1},
-		{0x7F, 1},          // the largest one-byte value
-		{0x80, 2},          // one more needs a second byte
-		{0x3FFF, 2},        // the largest two-byte value
+		{0x7F, 1},   // the largest one-byte value
+		{0x80, 2},   // one more needs a second byte
+		{0x3FFF, 2}, // the largest two-byte value
 		{0x4000, 3},
 		{0x1FFFFF, 3},
 		{0x200000, 4},
