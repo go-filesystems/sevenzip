@@ -44,26 +44,60 @@ const signatureLen = 32
 // be read without decoding any other, which is what a solid archive gives up.
 type Writer struct {
 	w      io.WriteSeeker
+	coder  *coder
 	pos    int64 // bytes of packed data written so far
 	cur    *entryWriter
 	files  []fileRecord
 	closed bool
 }
 
+// Option settles how a Writer stores what it is given.
+type Option func(*config)
+
+type config struct {
+	method Method
+	dict   int
+}
+
+// WithMethod chooses how entries are stored. The default is Store.
+func WithMethod(m Method) Option { return func(c *config) { c.method = m } }
+
+// WithDictionary asks for an LZMA2 dictionary of at least this many bytes.
+//
+// At least, because the format names sizes from a fixed sequence rather than
+// carrying a number: the smallest one big enough is used, and it is that size
+// the stream is encoded with. Asking for something the sequence cannot name and
+// being given the next one up is the format's arithmetic, not a rounding this
+// package chose.
+func WithDictionary(bytes int) Option { return func(c *config) { c.dict = bytes } }
+
 // fileRecord is what the header will have to say about one entry.
 type fileRecord struct {
-	name       string
+	name string
+	// unpackSize is what the entry holds; packSize is what it takes on disk.
+	// They are equal for Store, which is why a store-only writer cannot tell
+	// whether it has put them in the right sections -- and they go in different
+	// sections: PackInfo carries the packed sizes, CodersUnpackSize the others.
 	unpackSize int64
+	packSize   int64
 	crc        uint32
 }
 
 // NewWriter reserves the signature header and returns a Writer ready for its
 // first entry.
-func NewWriter(w io.WriteSeeker) (*Writer, error) {
+func NewWriter(w io.WriteSeeker, opts ...Option) (*Writer, error) {
+	cfg := config{method: Store, dict: 1 << 22}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	c, err := newCoder(cfg.method, cfg.dict)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := w.Write(make([]byte, signatureLen)); err != nil {
 		return nil, err
 	}
-	return &Writer{w: w}, nil
+	return &Writer{w: w, coder: c}, nil
 }
 
 // Create starts an entry and returns the writer its contents go to.
@@ -83,7 +117,13 @@ func (z *Writer) Create(name string) (io.Writer, error) {
 	if name == "" {
 		return nil, errors.New("sevenzip: an entry with no name")
 	}
-	z.cur = &entryWriter{z: z, name: name, crc: crc32.NewIEEE()}
+	counted := &countingWriter{w: z.w}
+	sink, finish, err := z.coder.wrap(counted)
+	if err != nil {
+		return nil, err
+	}
+	z.cur = &entryWriter{z: z, name: name, crc: crc32.NewIEEE(),
+		sink: sink, counted: counted, finish: finish}
 	return z.cur, nil
 }
 
@@ -94,9 +134,17 @@ func (z *Writer) finishEntry() error {
 	if e == nil {
 		return nil
 	}
+	// The compressor's last chunk is written by its Close, so the packed size is
+	// not knowable before it: reading the counter first reports an entry
+	// shorter than it is, and the archive then points past its own data.
+	if err := e.finish(); err != nil {
+		return err
+	}
+	z.pos += e.counted.n
 	z.files = append(z.files, fileRecord{
 		name:       e.name,
 		unpackSize: e.n,
+		packSize:   e.counted.n,
 		crc:        e.crc.Sum32(),
 	})
 	return nil
@@ -164,10 +212,13 @@ func writeSignature(w io.Writer, headerOffset, headerSize int64, headerCRC uint3
 // entryWriter is one open entry. It counts and checksums what goes through it,
 // because the header has to say both and neither is knowable afterwards.
 type entryWriter struct {
-	z    *Writer
-	name string
-	n    int64
-	crc  interface {
+	z       *Writer
+	name    string
+	n       int64 // bytes handed IN, which is the unpacked size
+	sink    io.Writer
+	counted *countingWriter
+	finish  func() error
+	crc     interface {
 		io.Writer
 		Sum32() uint32
 	}
@@ -177,10 +228,11 @@ func (e *entryWriter) Write(p []byte) (int, error) {
 	if e.z.closed {
 		return 0, ErrClosed
 	}
-	n, err := e.z.w.Write(p)
+	// The checksum is of what came IN. It is the uncompressed data every reader
+	// checks, so taking it after the coder would check the wrong bytes.
+	n, err := e.sink.Write(p)
 	if n > 0 {
 		e.n += int64(n)
-		e.z.pos += int64(n)
 		_, _ = e.crc.Write(p[:n])
 	}
 	return n, err
@@ -216,7 +268,7 @@ func (z *Writer) writePackInfo(b *bytes.Buffer) {
 	_ = writeNumber(b, uint64(len(z.files)))
 	b.WriteByte(idSize)
 	for _, f := range z.files {
-		_ = writeNumber(b, uint64(f.unpackSize))
+		_ = writeNumber(b, uint64(f.packSize))
 	}
 	b.WriteByte(idEnd)
 }
@@ -231,10 +283,12 @@ func (z *Writer) writeUnpackInfo(b *bytes.Buffer) {
 	b.WriteByte(0) // external: the folder definitions are right here
 	for range z.files {
 		_ = writeNumber(b, 1) // one coder
-		// The coder's flags byte: the low four bits are the length of its id,
-		// and the id of Copy is one byte of zero. No attributes, not complex.
-		b.WriteByte(0x01)
-		b.WriteByte(0x00) // coder id: Copy
+		b.WriteByte(z.coder.flags())
+		b.Write(z.coder.id)
+		if len(z.coder.props) > 0 {
+			_ = writeNumber(b, uint64(len(z.coder.props)))
+			b.Write(z.coder.props)
+		}
 	}
 
 	b.WriteByte(idCodersUnpackSize)
