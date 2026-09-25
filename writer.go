@@ -208,13 +208,8 @@ func (z *Writer) create(name string, perm fs.FileMode) (io.Writer, error) {
 	if name == "" {
 		return nil, errors.New("sevenzip: an entry with no name")
 	}
-	counted := &countingWriter{w: z.w}
-	sink, finish, err := z.coder.wrap(counted)
-	if err != nil {
-		return nil, err
-	}
 	z.cur = &entryWriter{z: z, name: name, perm: perm, crc: crc32.NewIEEE(),
-		sink: sink, counted: counted, finish: finish}
+		counted: &countingWriter{w: z.w}}
 	return z.cur, nil
 }
 
@@ -228,8 +223,14 @@ func (z *Writer) finishEntry() error {
 	// The compressor's last chunk is written by its Close, so the packed size is
 	// not knowable before it: reading the counter first reports an entry
 	// shorter than it is, and the archive then points past its own data.
-	if err := e.finish(); err != nil {
-		return err
+	//
+	// finish is nil when no byte ever arrived, and there is then nothing to
+	// close because nothing was opened -- see entryWriter.Write for why that
+	// matters.
+	if e.finish != nil {
+		if err := e.finish(); err != nil {
+			return err
+		}
 	}
 	z.pos += e.counted.n
 	z.files = append(z.files, fileRecord{
@@ -309,18 +310,43 @@ type entryWriter struct {
 	name    string
 	perm    fs.FileMode
 	n       int64 // bytes handed IN, which is the unpacked size
-	sink    io.Writer
 	counted *countingWriter
-	finish  func() error
-	crc     interface {
+	// sink and finish are nil until the first byte arrives, because an entry
+	// that gets none must leave NOTHING behind. See Write.
+	sink   io.Writer
+	finish func() error
+	crc    interface {
 		io.Writer
 		Sum32() uint32
 	}
 }
 
+// Write puts bytes in the entry, and creates the coder the first time it is
+// called rather than when the entry was opened.
+//
+// That is not laziness for its own sake. An entry that receives no bytes is
+// recorded as an EMPTY FILE, which by definition has no stream, so the header
+// says nothing about it -- but an LZMA2 encoder that is opened and closed with
+// no input still emits its end-of-stream marker. Those bytes would sit in the
+// packed area belonging to nobody, and every stream after them would be found
+// one byte late.
+//
+// Store hides this completely, because a Store coder with no input writes
+// nothing, which is why a writer can be correct for every stored archive and
+// wrong for every compressed one holding an empty file.
 func (e *entryWriter) Write(p []byte) (int, error) {
 	if e.z.closed {
 		return 0, ErrClosed
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if e.sink == nil {
+		sink, finish, err := e.z.coder.wrap(e.counted)
+		if err != nil {
+			return 0, err
+		}
+		e.sink, e.finish = sink, finish
 	}
 	// The checksum is of what came IN. It is the uncompressed data every reader
 	// checks, so taking it after the coder would check the wrong bytes.

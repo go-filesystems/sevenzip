@@ -224,15 +224,31 @@ type entry struct {
 	body string
 }
 
+// methods are the two ways an entry can be stored, and both judges run over
+// both of them.
+//
+// The method was a constant in every earlier test, and that is how an archive
+// holding an empty file came to be correct under Store and broken under LZMA2
+// for every entry after it: Store writes nothing for an entry with no bytes,
+// a compressor writes its end-of-stream marker. A fixture that fixes the method
+// cannot see the difference between a rule and an accident of that method.
+var methods = []struct {
+	name   string
+	method Method
+}{
+	{"Store", Store},
+	{"LZMA2", LZMA2},
+}
+
 // writeTree builds an archive through AddDir and AddFile, in the order given.
-func writeTree(t *testing.T, entries []entry) string {
+func writeTree(t *testing.T, m Method, entries []entry) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "tree.7z")
 	f, err := os.Create(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	z, err := NewWriter(f)
+	z, err := NewWriter(f, WithMethod(m))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,45 +311,56 @@ func TestTheReferenceExtractsADirectoryAsADirectory(t *testing.T) {
 		t.Skip("no 7-Zip binary here to judge the archive with")
 	}
 
-	archive := writeTree(t, tree())
-	into := filepath.Join(t.TempDir(), "out")
+	for _, m := range methods {
+		t.Run(m.name, func(t *testing.T) {
+			archive := writeTree(t, m.method, tree())
+			into := filepath.Join(t.TempDir(), "out")
 
-	out, err := exec.Command(bin, "x", "-bso0", "-bsp0", "-o"+into, archive).CombinedOutput()
-	if err != nil {
-		t.Fatalf("7-Zip could not extract it: %v\n%s", err, out)
-	}
+			out, err := exec.Command(bin, "x", "-bso0", "-bsp0", "-o"+into, archive).CombinedOutput()
+			if err != nil {
+				t.Fatalf("7-Zip could not extract it: %v\n%s", err, out)
+			}
 
-	for _, e := range tree() {
-		fi, err := os.Lstat(filepath.Join(into, e.name))
-		if err != nil {
-			t.Errorf("%s did not arrive: %v", e.name, err)
-			continue
-		}
-		if fi.IsDir() != e.dir {
-			t.Errorf("%s: IsDir() = %v, want %v", e.name, fi.IsDir(), e.dir)
-			continue
-		}
-		if e.dir {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(into, e.name))
-		if err != nil {
-			t.Errorf("%s: %v", e.name, err)
-			continue
-		}
-		if string(b) != e.body {
-			t.Errorf("%s = %q, want %q", e.name, b, e.body)
-		}
-		if got := fi.Mode().Perm(); got != e.perm {
-			t.Errorf("%s: mode %v, want %v", e.name, got, e.perm)
-		}
+			for _, e := range tree() {
+				fi, err := os.Lstat(filepath.Join(into, e.name))
+				if err != nil {
+					t.Errorf("%s did not arrive: %v", e.name, err)
+					continue
+				}
+				if fi.IsDir() != e.dir {
+					t.Errorf("%s: IsDir() = %v, want %v", e.name, fi.IsDir(), e.dir)
+					continue
+				}
+				if e.dir {
+					continue
+				}
+				b, err := os.ReadFile(filepath.Join(into, e.name))
+				if err != nil {
+					t.Errorf("%s: %v", e.name, err)
+					continue
+				}
+				if string(b) != e.body {
+					t.Errorf("%s = %q, want %q", e.name, b, e.body)
+				}
+				if got := fi.Mode().Perm(); got != e.perm {
+					t.Errorf("%s: mode %v, want %v", e.name, got, e.perm)
+				}
+			}
+		})
 	}
 }
 
 // TestTheGoReaderTellsTheThreeKindsApart is the second judge, and it is the one
 // that runs where no binary does.
 func TestTheGoReaderTellsTheThreeKindsApart(t *testing.T) {
-	archive := writeTree(t, tree())
+	for _, m := range methods {
+		t.Run(m.name, func(t *testing.T) { goReaderTellsThemApart(t, m.method) })
+	}
+}
+
+func goReaderTellsThemApart(t *testing.T, m Method) {
+	t.Helper()
+	archive := writeTree(t, m, tree())
 
 	r, err := sevenzip.OpenReader(archive)
 	if err != nil {
