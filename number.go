@@ -14,8 +14,6 @@
 package sevenzip
 
 import (
-	"encoding/binary"
-	"errors"
 	"io"
 )
 
@@ -59,9 +57,6 @@ const (
 	versionMajor = 0
 	versionMinor = 4
 )
-
-// ErrTooLarge is returned for a number the format cannot carry.
-var ErrTooLarge = errors.New("sevenzip: number does not fit the format's encoding")
 
 // writeNumber writes 7z's variable-length number.
 //
@@ -123,14 +118,3 @@ func readNumber(r io.ByteReader) (uint64, error) {
 	}
 	return v, nil
 }
-
-// writeByte and writeU32/U64 keep the little-endian fixed-width fields the
-// signature header uses, which are NOT the variable-length encoding above --
-// mixing the two is the other way this header goes wrong.
-func writeByte(w io.Writer, b byte) error {
-	_, err := w.Write([]byte{b})
-	return err
-}
-
-func putU64(b []byte, v uint64) { binary.LittleEndian.PutUint64(b, v) }
-func putU32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
