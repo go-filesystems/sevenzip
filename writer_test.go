@@ -259,7 +259,7 @@ func writeTree(t *testing.T, m Method, entries []entry) string {
 			}
 			continue
 		}
-		if err := z.AddFile(e.name, e.perm, strings.NewReader(e.body)); err != nil {
+		if err := z.AddFile(e.name, e.perm, int64(len(e.body)), strings.NewReader(e.body)); err != nil {
 			t.Fatalf("AddFile(%q): %v", e.name, err)
 		}
 	}

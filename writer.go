@@ -182,12 +182,24 @@ func (z *Writer) AddDir(name string, perm fs.FileMode) error {
 	return nil
 }
 
-// AddFile records a file and copies its contents in.
+// AddFile records a file of size bytes and copies them in.
 //
 // AddDir and AddFile together are the shape a deferred write layer seals
 // through, so that the thing rewriting an archive at the end does not have to
 // know which format it is rewriting.
-func (z *Writer) AddFile(name string, perm fs.FileMode, src io.Reader) error {
+//
+// The size is accepted and NOT used, and that is the format's doing rather than
+// an oversight: 7z records an entry's unpacked length in a header written at the
+// END, so this writer counts the bytes as they go by and already knows. tar
+// cannot do that -- its length goes in a header BEFORE its data -- so the
+// contract carries the size for tar's sake, and a format that does not need it
+// ignores it.
+//
+// It is deliberately not checked against what arrives, either. The counted
+// length is the truth this archive will be read by, so trusting the count over
+// the claim is what keeps the archive consistent with itself; a caller whose
+// claim was wrong gets an archive that is right.
+func (z *Writer) AddFile(name string, perm fs.FileMode, _ int64, src io.Reader) error {
 	w, err := z.create(name, perm)
 	if err != nil {
 		return err
