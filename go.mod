@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/bodgit/sevenzip v1.6.5
-	github.com/ulikunitz/xz v0.5.15
+	github.com/ulikunitz/xz v0.5.17
 )
 
 require (
