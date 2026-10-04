@@ -1,6 +1,6 @@
 module github.com/go-filesystems/sevenzip
 
-go 1.26.4
+go 1.27.1
 
 require (
 	github.com/bodgit/sevenzip v1.6.5
