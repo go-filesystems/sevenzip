@@ -45,7 +45,9 @@ written last.
 | `Store` | keeps the bytes as they are. Every reader takes it, it costs nothing to write, and an entry can be read without decoding anything |
 | `LZMA2` | what 7-Zip writes by default, and what the name of the format means to most people |
 
-`WithMethod` and `WithDictionary` choose; `Store` is the default.
+`WithMethod` and `WithDictionary` choose; `Store` is the default. On a 32-bit
+platform (386, arm) a dictionary of 2 GiB or more does not fit an `int`:
+`NewWriter` refuses it with `ErrDictionaryTooLarge` instead of wrapping.
 
 ## ⛔ An empty entry must not write a stream
 

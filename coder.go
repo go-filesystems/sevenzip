@@ -6,6 +6,7 @@ package sevenzip
 import (
 	"errors"
 	"io"
+	"math"
 
 	"github.com/ulikunitz/xz/lzma"
 )
@@ -43,14 +44,48 @@ var ErrUnknownMethod = errors.New("sevenzip: unknown method")
 // the whole 4 GiB. A writer therefore cannot store an arbitrary size; it stores
 // the smallest one of these that is big enough, and must then USE that size
 // rather than the one it was asked for, or the property and the stream disagree.
-func dictProps(want int) (props byte, actual int) {
+//
+// The sizes reach 4 GiB, which does not fit an int on a 32-bit platform, so the
+// arithmetic is done in uint64 and the result is converted with toInt: a size
+// the platform cannot hold is refused with ErrDictionaryTooLarge, never wrapped.
+func dictProps(want int) (props byte, actual int, err error) {
+	p, size := dictSize(int64(want))
+	actual, err = toInt(size)
+	if err != nil {
+		return 0, 0, err
+	}
+	return p, actual, nil
+}
+
+// dictSize is dictProps without the platform: the property byte and the size it
+// names, as a uint64 that holds every size the encoding can name on any
+// architecture. A want at or below zero gets the smallest name.
+func dictSize(want int64) (props byte, size uint64) {
 	for p := 0; p < 40; p++ {
-		size := (2 | (p & 1)) << (uint(p)/2 + 11)
-		if size >= want {
+		size := uint64(2|(p&1)) << (uint(p)/2 + 11)
+		if want <= 0 || size >= uint64(want) {
 			return byte(p), size
 		}
 	}
 	return 40, 1 << 32 // the largest the encoding can name
+}
+
+// ErrDictionaryTooLarge is returned when the dictionary the format would have to
+// name does not fit an int on this platform: on a 32-bit build, anything over
+// 2 GiB less one byte.
+var ErrDictionaryTooLarge = errors.New("sevenzip: dictionary size does not fit this platform")
+
+// intMax is the largest size toInt accepts. It is math.MaxInt, and a variable
+// only so a test can set it to the 32-bit value and exercise the refusal on a
+// 64-bit machine.
+var intMax uint64 = math.MaxInt
+
+// toInt converts a size to int, refusing what would wrap.
+func toInt(v uint64) (int, error) {
+	if v > intMax {
+		return 0, ErrDictionaryTooLarge
+	}
+	return int(v), nil
 }
 
 // coder is one method's contribution to a folder: what the header says about it,
@@ -71,7 +106,10 @@ func newCoder(m Method, wantDict int) (*coder, error) {
 	}
 	c := &coder{method: m, id: id}
 	if m == LZMA2 {
-		p, actual := dictProps(wantDict)
+		p, actual, err := dictProps(wantDict)
+		if err != nil {
+			return nil, err
+		}
 		c.props = []byte{p}
 		c.dict = actual
 	}
