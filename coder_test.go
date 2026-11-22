@@ -45,14 +45,17 @@ func TestDictPropsNamesOnlyTheSizesTheFormatCanName(t *testing.T) {
 		{(1 << 20) + 1, 17, 3 << 19},
 		{1 << 22, 20, 1 << 22}, // the default this package asks for
 	} {
-		props, actual := dictProps(c.want)
+		props, actual, err := dictProps(c.want)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if props != c.props || actual != c.actual {
 			t.Errorf("dictProps(%d) = (%d, %d), want (%d, %d)",
 				c.want, props, actual, c.props, c.actual)
 		}
 		// The property must decode back to the size that was returned.
-		back := (2 | (int(props) & 1)) << (uint(props)/2 + 11)
-		if props < 40 && back != actual {
+		back := uint64(2|(int(props)&1)) << (uint(props)/2 + 11)
+		if props < 40 && back != uint64(actual) {
 			t.Errorf("property %d decodes to %d, but %d was reported", props, back, actual)
 		}
 	}
@@ -158,8 +161,8 @@ func TestTheRefusalsAreNamed(t *testing.T) {
 
 	// A dictionary bigger than the encoding can name gets the largest name,
 	// which is what 40 means. Nothing can ask for more.
-	if props, actual := dictProps(1 << 33); props != 40 || actual != 1<<32 {
-		t.Errorf("dictProps(8 GiB) = (%d, %d), want (40, 4 GiB)", props, actual)
+	if props, actual := dictSize(1 << 33); props != 40 || actual != 1<<32 {
+		t.Errorf("dictSize(8 GiB) = (%d, %d), want (40, 4 GiB)", props, actual)
 	}
 
 	f, err := os.Create(filepath.Join(t.TempDir(), "a.7z"))
